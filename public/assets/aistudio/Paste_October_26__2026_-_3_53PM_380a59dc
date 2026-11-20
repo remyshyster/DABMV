@@ -1,0 +1,758 @@
+As a Principal Systems Architect, I have designed this system around strict state-view separation (Event Sourcing / Lockstep Simulation).
+To achieve guaranteed client-side determinism across different browsers and CPU architectures:
+No non-deterministic APIs (Date.now(), Math.random(), or unsorted object key iterations) are permitted inside the simulation loop.
+Coordinate Normalization: Since both players build on a local 3x3 grid (x: 0..2, y: 0..2), the engine projects boardB onto the opposite side of the arena (y + 3) before calculating Euclidean distances.
+Read-Only Playback: The UI acts strictly as a dumb terminal projecting pre-computed state transitions from the CombatEvent[] tape.
+Here is the complete implementation broken down into your five sequential modules.
+1. Types & Seeded RNG (src/types/combat.ts)
+Because Supabase stores the shared seed as a string, we combine a deterministic string hashing algorithm (FNV-1a) with Mulberry32 to produce a pure, repeatable pseudo-random number generator.
+code
+TypeScript
+// src/types/combat.ts
+
+export type UnitType = 'Knight' | 'Archer';
+
+export interface Unit {
+  id: string;
+  type: UnitType;
+  hp: number;
+  maxHp: number;
+  attack: number;
+}
+
+export interface PositionedUnit extends Unit {
+  x: number;
+  y: number;
+}
+
+export type BoardState = PositionedUnit[];
+
+export type CombatEventType = 'attack' | 'death' | 'end';
+
+export interface CombatEvent {
+  type: CombatEventType;
+  sourceId: string;
+  targetId: string;
+  damage: number;
+  remainingHp: number;
+}
+
+/**
+ * Converts an arbitrary string seed into a deterministic 32-bit unsigned integer
+ * using the FNV-1a hash algorithm.
+ */
+function hashStringToUint32(str: string): number {
+  let hash = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+/**
+ * Mulberry32 Seeded PRNG.
+ * Returns a deterministic function generating floats in [0, 1).
+ */
+export function createSeededRNG(seedString: string): () => number {
+  let state = hashStringToUint32(seedString);
+
+  return function nextFloat(): number {
+    state += 0x6d2b79f5;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+2. Phase 1: The Headless Engine (src/engine/simulateCombat.ts)
+This module is pure TypeScript with zero external dependencies. It normalizes the two boards into a unified arena, uses the seeded PRNG for initiative shuffling and tie-breaking equidistant targets, and resolves the entire battle synchronously.
+code
+TypeScript
+// src/engine/simulateCombat.ts
+
+import { BoardState, CombatEvent, PositionedUnit, createSeededRNG } from '../types/combat';
+
+interface InternalUnit extends PositionedUnit {
+  team: 'A' | 'B';
+}
+
+/**
+ * Deterministic Fisher-Yates shuffle using our seeded PRNG.
+ */
+function shuffleDeterministic<T>(array: T[], rng: () => number): T[] {
+  const copy = [...array];
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const temp = copy[i];
+    copy[i] = copy[j];
+    copy[j] = temp;
+  }
+  return copy;
+}
+
+/**
+ * Squared Euclidean distance avoids floating-point square root drift across architectures.
+ */
+function getDistanceSquared(u1: InternalUnit, u2: InternalUnit): number {
+  const dx = u1.x - u2.x;
+  const dy = u1.y - u2.y;
+  return dx * dx + dy * dy;
+}
+
+export function simulateCombat(
+  boardA: BoardState,
+  boardB: BoardState,
+  seed: string
+): CombatEvent[] {
+  const rng = createSeededRNG(seed);
+  const events: CombatEvent[] = [];
+
+  // Deep clone and project coordinates into a shared 3x6 arena:
+  // Board A occupies y: [0..2], Board B is offset to y: [3..5]
+  const unitsA: InternalUnit[] = boardA.map((u) => ({
+    ...u,
+    team: 'A',
+  }));
+
+  const unitsB: InternalUnit[] = boardB.map((u) => ({
+    ...u,
+    y: u.y + 3,
+    team: 'B',
+  }));
+
+  // Canonical sort by ID first to guarantee identical memory order before shuffling
+  const roster: InternalUnit[] = [...unitsA, ...unitsB].sort((a, b) =>
+    a.id.localeCompare(b.id)
+  );
+
+  let tickCount = 0;
+  const MAX_TICKS = 1000; // Circuit breaker against infinite loops
+
+  while (tickCount < MAX_TICKS) {
+    tickCount++;
+
+    const livingA = roster.filter((u) => u.team === 'A' && u.hp > 0);
+    const livingB = roster.filter((u) => u.team === 'B' && u.hp > 0);
+
+    // Check termination conditions
+    if (livingA.length === 0 || livingB.length === 0) {
+      const winnerTeam = livingA.length > 0 ? 'TEAM_A' : livingB.length > 0 ? 'TEAM_B' : 'DRAW';
+      events.push({
+        type: 'end',
+        sourceId: winnerTeam,
+        targetId: 'NONE',
+        damage: 0,
+        remainingHp: 0,
+      });
+      break;
+    }
+
+    // Deterministically shuffle turn order for the current combat round
+    const activeTurnOrder = shuffleDeterministic(
+      roster.filter((u) => u.hp > 0),
+      rng
+    );
+
+    for (const attacker of activeTurnOrder) {
+      // A unit may have died earlier in this same tick
+      if (attacker.hp <= 0) continue;
+
+      const livingEnemies = roster.filter(
+        (u) => u.team !== attacker.team && u.hp > 0
+      );
+
+      if (livingEnemies.length === 0) break;
+
+      // Find closest enemy (or enemies if equidistant)
+      let minDistanceSq = Infinity;
+      let closestCandidates: InternalUnit[] = [];
+
+      for (const enemy of livingEnemies) {
+        const distSq = getDistanceSquared(attacker, enemy);
+        if (distSq < minDistanceSq) {
+          minDistanceSq = distSq;
+          closestCandidates = [enemy];
+        } else if (distSq === minDistanceSq) {
+          closestCandidates.push(enemy);
+        }
+      }
+
+      // Break ties deterministically using seeded RNG
+      const targetIndex = Math.floor(rng() * closestCandidates.length);
+      const target = closestCandidates[targetIndex];
+
+      // Resolve Attack
+      const damage = attacker.attack;
+      target.hp = Math.max(0, target.hp - damage);
+
+      events.push({
+        type: 'attack',
+        sourceId: attacker.id,
+        targetId: target.id,
+        damage,
+        remainingHp: target.hp,
+      });
+
+      // Resolve Death
+      if (target.hp === 0) {
+        events.push({
+          type: 'death',
+          sourceId: attacker.id,
+          targetId: target.id,
+          damage: 0,
+          remainingHp: 0,
+        });
+      }
+    }
+  }
+
+  return events;
+}
+3. Phase 3: Board Builder UI (src/components/BoardBuilder.tsx)
+This component provides unit archetype selection, a 3x3 tactical grid, live JSON serialization output, and the matchmaking trigger. It uses crypto.randomUUID() for collision-free unit identifiers across distributed clients.
+code
+Tsx
+// src/components/BoardBuilder.tsx
+
+import React, { useState } from 'react';
+import { BoardState, PositionedUnit, UnitType } from '../types/combat';
+
+const UNIT_TEMPLATES: Record<UnitType, Omit<PositionedUnit, 'id' | 'x' | 'y'>> = {
+  Knight: { type: 'Knight', hp: 100, maxHp: 100, attack: 25 },
+  Archer: { type: 'Archer', hp: 60, maxHp: 60, attack: 40 },
+};
+
+interface BoardBuilderProps {
+  onLockIn: (board: BoardState) => void;
+  disabled?: boolean;
+}
+
+export const BoardBuilder: React.FC<BoardBuilderProps> = ({ onLockIn, disabled = false }) => {
+  const [selectedUnitType, setSelectedUnitType] = useState<UnitType>('Knight');
+  const [board, setBoard] = useState<BoardState>([]);
+
+  const handleCellClick = (x: number, y: number) => {
+    if (disabled) return;
+
+    setBoard((prevBoard) => {
+      const existingIndex = prevBoard.findIndex((u) => u.x === x && u.y === y);
+
+      // Clicking an occupied cell removes the unit
+      if (existingIndex !== -1) {
+        return prevBoard.filter((_, idx) => idx !== existingIndex);
+      }
+
+      // Clicking an empty cell places the selected unit
+      const template = UNIT_TEMPLATES[selectedUnitType];
+      const newUnit: PositionedUnit = {
+        id: crypto.randomUUID(),
+        x,
+        y,
+        ...template,
+      };
+
+      return [...prevBoard, newUnit];
+    });
+  };
+
+  return (
+    <div style={{ display: 'flex', gap: '2rem', fontFamily: 'sans-serif', alignItems: 'flex-start' }}>
+      <div>
+        <h3>1. Select Unit Archetype</h3>
+        <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1.5rem' }}>
+          {(['Knight', 'Archer'] as UnitType[]).map((type) => (
+            <button
+              key={type}
+              disabled={disabled}
+              onClick={() => setSelectedUnitType(type)}
+              style={{
+                padding: '0.5rem 1rem',
+                fontWeight: selectedUnitType === type ? 'bold' : 'normal',
+                backgroundColor: selectedUnitType === type ? '#2563eb' : '#e5e7eb',
+                color: selectedUnitType === type ? '#ffffff' : '#1f2937',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+              }}
+            >
+              {type} (HP: {UNIT_TEMPLATES[type].hp} | ATK: {UNIT_TEMPLATES[type].attack})
+            </button>
+          ))}
+        </div>
+
+        <h3>2. Place on 3x3 Grid (Click to Add/Remove)</h3>
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(3, 90px)',
+            gridTemplateRows: 'repeat(3, 90px)',
+            gap: '8px',
+            marginBottom: '1.5rem',
+          }}
+        >
+          {Array.from({ length: 9 }).map((_, idx) => {
+            const x = idx % 3;
+            const y = Math.floor(idx / 3);
+            const occupant = board.find((u) => u.x === x && u.y === y);
+
+            return (
+              <div
+                key={`${x}-${y}`}
+                onClick={() => handleCellClick(x, y)}
+                style={{
+                  border: '2px solid #9ca3af',
+                  borderRadius: '6px',
+                  backgroundColor: occupant ? '#dbeafe' : '#f9fafb',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  cursor: disabled ? 'not-allowed' : 'pointer',
+                  userSelect: 'none',
+                }}
+              >
+                {occupant ? (
+                  <>
+                    <strong>{occupant.type}</strong>
+                    <span style={{ fontSize: '0.75rem', color: '#4b5563' }}>
+                      HP: {occupant.hp}
+                    </span>
+                  </>
+                ) : (
+                  <span style={{ color: '#9ca3af', fontSize: '0.75rem' }}>
+                    ({x}, {y})
+                  </span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        <button
+          onClick={() => onLockIn(board)}
+          disabled={disabled || board.length === 0}
+          style={{
+            padding: '0.75rem 1.5rem',
+            backgroundColor: board.length === 0 || disabled ? '#9ca3af' : '#16a34a',
+            color: '#fff',
+            border: 'none',
+            borderRadius: '4px',
+            fontWeight: 'bold',
+            cursor: board.length === 0 || disabled ? 'not-allowed' : 'pointer',
+          }}
+        >
+          {disabled ? 'Searching for Opponent...' : 'Lock In / Search for Match'}
+        </button>
+      </div>
+
+      <div style={{ flex: 1 }}>
+        <h3>Live BoardState JSON</h3>
+        <pre
+          style={{
+            backgroundColor: '#111827',
+            color: '#10b981',
+            padding: '1rem',
+            borderRadius: '6px',
+            maxHeight: '360px',
+            overflowY: 'auto',
+            fontSize: '0.8rem',
+          }}
+        >
+          {JSON.stringify(board, null, 2)}
+        </pre>
+      </div>
+    </div>
+  );
+};
+4. Phase 4: Supabase Sync Loop (src/components/MatchCoordinator.tsx)
+Before running this component, ensure your Supabase matches table has Realtime enabled with the following schema:
+code
+SQL
+create table public.matches (
+  id uuid primary key default gen_random_uuid(),
+  status text not null check (status in ('waiting', 'ready')),
+  board_a jsonb not null,
+  board_b jsonb,
+  seed text not null,
+  created_at timestamptz default now()
+);
+alter publication supabase_realtime add table public.matches;
+This controller manages matchmaking, subscribes to public:matches via postgres_changes, and immediately pipes board_a, board_b, and seed into simulateCombat() once status === 'ready'.
+code
+Tsx
+// src/components/MatchCoordinator.tsx
+
+import React, { useEffect, useState } from 'react';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { BoardState, CombatEvent } from '../types/combat';
+import { simulateCombat } from '../engine/simulateCombat';
+import { BoardBuilder } from './BoardBuilder';
+import { CombatVisualizer } from './CombatVisualizer';
+
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || 'https://your-project.supabase.co';
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || 'your-anon-key';
+
+const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+interface MatchRow {
+  id: string;
+  status: 'waiting' | 'ready';
+  board_a: BoardState;
+  board_b: BoardState | null;
+  seed: string;
+}
+
+export const MatchCoordinator: React.FC = () => {
+  const [activeMatchId, setActiveMatchId] = useState<string | null>(null);
+  const [matchStatus, setMatchStatus] = useState<'idle' | 'waiting' | 'ready'>('idle');
+  const [combatLog, setCombatLog] = useState<CombatEvent[] | null>(null);
+  const [initialBoards, setInitialBoards] = useState<{
+    boardA: BoardState;
+    boardB: BoardState;
+  } | null>(null);
+
+  // Listen to Postgres changes on public:matches
+  useEffect(() => {
+    if (!activeMatchId) return;
+
+    const channel = supabase
+      .channel('public:matches')
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'matches',
+          filter: `id=eq.${activeMatchId}`,
+        },
+        (payload) => {
+          const updatedMatch = payload.new as MatchRow;
+
+          if (updatedMatch.status === 'ready' && updatedMatch.board_b) {
+            setMatchStatus('ready');
+            setInitialBoards({
+              boardA: updatedMatch.board_a,
+              boardB: updatedMatch.board_b,
+            });
+
+            // Deterministic Lockstep Execution:
+            // Both clients execute identical math locally from the shared payload
+            const events = simulateCombat(
+              updatedMatch.board_a,
+              updatedMatch.board_b,
+              updatedMatch.seed
+            );
+            setCombatLog(events);
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [activeMatchId]);
+
+  const handleLockIn = async (myBoard: BoardState) => {
+    setMatchStatus('waiting');
+
+    // 1. Search for an existing match waiting for an opponent
+    const { data: openMatch, error: fetchError } = await supabase
+      .from('matches')
+      .select('*')
+      .eq('status', 'waiting')
+      .order('created_at', { ascending: true })
+      .limit(1)
+      .maybeSingle<MatchRow>();
+
+    if (fetchError) {
+      console.error('Matchmaking query failed:', fetchError);
+      setMatchStatus('idle');
+      return;
+    }
+
+    // 2A. Found an open match -> Join as Player B and transition status to 'ready'
+    if (openMatch) {
+      setActiveMatchId(openMatch.id);
+
+      const { data: updatedMatch, error: updateError } = await supabase
+        .from('matches')
+        .update({
+          board_b: myBoard,
+          status: 'ready',
+        })
+        .eq('id', openMatch.id)
+        .select()
+        .single<MatchRow>();
+
+      if (updateError || !updatedMatch || !updatedMatch.board_b) {
+        console.error('Failed to join match:', updateError);
+        setMatchStatus('idle');
+        return;
+      }
+
+      // Trigger simulation immediately for Player B as well
+      setMatchStatus('ready');
+      setInitialBoards({
+        boardA: updatedMatch.board_a,
+        boardB: updatedMatch.board_b,
+      });
+
+      const events = simulateCombat(
+        updatedMatch.board_a,
+        updatedMatch.board_b,
+        updatedMatch.seed
+      );
+      setCombatLog(events);
+      return;
+    }
+
+    // 2B. No open match found -> Create a new lobby as Player A
+    const sharedSeed = crypto.randomUUID();
+    const { data: createdMatch, error: insertError } = await supabase
+      .from('matches')
+      .insert({
+        status: 'waiting',
+        board_a: myBoard,
+        seed: sharedSeed,
+      })
+      .select()
+      .single<MatchRow>();
+
+    if (insertError || !createdMatch) {
+      console.error('Failed to create match:', insertError);
+      setMatchStatus('idle');
+      return;
+    }
+
+    setActiveMatchId(createdMatch.id);
+  };
+
+  return (
+    <div style={{ padding: '2rem' }}>
+      <h1>Deterministic Auto-Battler MVP</h1>
+
+      {matchStatus !== 'ready' && (
+        <BoardBuilder onLockIn={handleLockIn} disabled={matchStatus === 'waiting'} />
+      )}
+
+      {matchStatus === 'ready' && combatLog && initialBoards && (
+        <CombatVisualizer
+          events={combatLog}
+          initialBoardA={initialBoards.boardA}
+          initialBoardB={initialBoards.boardB}
+        />
+      )}
+    </div>
+  );
+};
+5. Phase 5: Visualizing the Log (src/components/CombatVisualizer.tsx)
+In accordance with strict CQRS / Event-Sourcing principles, CombatVisualizer performs zero combat calculations. It does not subtract event.damage from unit.hp; instead, it directly overwrites the visual health state with event.remainingHp and deletes units upon receiving a 'death' event.
+code
+Tsx
+// src/components/CombatVisualizer.tsx
+
+import React, { useEffect, useState } from 'react';
+import { BoardState, CombatEvent, PositionedUnit } from '../types/combat';
+
+interface CombatVisualizerProps {
+  events: CombatEvent[];
+  initialBoardA: BoardState;
+  initialBoardB: BoardState;
+}
+
+interface VisualUnit extends PositionedUnit {
+  team: 'A' | 'B';
+}
+
+export const CombatVisualizer: React.FC<CombatVisualizerProps> = ({
+  events,
+  initialBoardA,
+  initialBoardB,
+}) => {
+  // Hydrate initial visual state dictionary keyed by unit ID
+  const [unitsById, setUnitsById] = useState<Record<string, VisualUnit>>(() => {
+    const map: Record<string, VisualUnit> = {};
+    initialBoardA.forEach((u) => {
+      map[u.id] = { ...u, team: 'A' };
+    });
+    initialBoardB.forEach((u) => {
+      map[u.id] = { ...u, y: u.y + 3, team: 'B' };
+    });
+    return map;
+  });
+
+  const [eventIndex, setEventIndex] = useState<number>(0);
+  const [damagedUnitId, setDamagedUnitId] = useState<string | null>(null);
+  const [attackerUnitId, setAttackerUnitId] = useState<string | null>(null);
+  const [winnerLabel, setWinnerLabel] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (eventIndex >= events.length) return;
+
+    const timer = setTimeout(() => {
+      const currentEvent = events[eventIndex];
+
+      if (currentEvent.type === 'attack') {
+        setAttackerUnitId(currentEvent.sourceId);
+        setDamagedUnitId(currentEvent.targetId);
+
+        // STRICT READ-ONLY STATE PROJECTION:
+        // We do not compute (hp - damage); we directly apply remainingHp from the log.
+        setUnitsById((prev) => {
+          const target = prev[currentEvent.targetId];
+          if (!target) return prev;
+          return {
+            ...prev,
+            [currentEvent.targetId]: {
+              ...target,
+              hp: currentEvent.remainingHp,
+            },
+          };
+        });
+      } else if (currentEvent.type === 'death') {
+        setDamagedUnitId(null);
+        setAttackerUnitId(null);
+
+        // Remove dead unit from the board
+        setUnitsById((prev) => {
+          const next = { ...prev };
+          delete next[currentEvent.targetId];
+          return next;
+        });
+      } else if (currentEvent.type === 'end') {
+        setDamagedUnitId(null);
+        setAttackerUnitId(null);
+        setWinnerLabel(currentEvent.sourceId);
+      }
+
+      setEventIndex((prevIdx) => prevIdx + 1);
+    }, 500);
+
+    return () => clearTimeout(timer);
+  }, [eventIndex, events]);
+
+  const activeUnits = Object.values(unitsById);
+  const currentEvent = events[Math.min(eventIndex, events.length - 1)];
+
+  return (
+    <div style={{ fontFamily: 'sans-serif', display: 'flex', gap: '2rem' }}>
+      <div>
+        <h2>Arena Playback (Step {eventIndex} / {events.length})</h2>
+        {winnerLabel && (
+          <div
+            style={{
+              padding: '0.75rem',
+              marginBottom: '1rem',
+              backgroundColor: '#fef08a',
+              border: '2px solid #eab308',
+              borderRadius: '6px',
+              fontWeight: 'bold',
+            }}
+          >
+            Combat Resolved — Winner: {winnerLabel}
+          </div>
+        )}
+
+        {/* 3x6 Combined Arena Grid (Rows 0-2: Team A, Rows 3-5: Team B) */}
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(3, 100px)',
+            gridTemplateRows: 'repeat(6, 90px)',
+            gap: '8px',
+          }}
+        >
+          {Array.from({ length: 18 }).map((_, idx) => {
+            const x = idx % 3;
+            const y = Math.floor(idx / 3);
+            const unit = activeUnits.find((u) => u.x === x && u.y === y);
+
+            const isFlashingRed = unit && unit.id === damagedUnitId;
+            const isAttacker = unit && unit.id === attackerUnitId;
+            const healthPercent = unit ? (unit.hp / unit.maxHp) * 100 : 0;
+
+            return (
+              <div
+                key={`${x}-${y}`}
+                style={{
+                  border: isAttacker
+                    ? '3px solid #f59e0b'
+                    : y < 3
+                    ? '2px solid #3b82f6'
+                    : '2px solid #a855f7',
+                  borderRadius: '6px',
+                  backgroundColor: isFlashingRed
+                    ? '#ef4444' // Flash red on damage
+                    : unit
+                    ? unit.team === 'A'
+                      ? '#eff6ff'
+                      : '#faf5ff'
+                    : '#f3f4f6',
+                  color: isFlashingRed ? '#ffffff' : '#111827',
+                  transition: 'background-color 0.15s ease',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  padding: '6px',
+                }}
+              >
+                {unit ? (
+                  <>
+                    <div style={{ fontSize: '0.75rem', fontWeight: 'bold' }}>
+                      [{unit.team}] {unit.type}
+                    </div>
+                    <div style={{ fontSize: '0.7rem', marginBottom: '4px' }}>
+                      {unit.hp} / {unit.maxHp} HP
+                    </div>
+                    {/* Health Bar */}
+                    <div
+                      style={{
+                        width: '100%',
+                        height: '8px',
+                        backgroundColor: '#d1d5db',
+                        borderRadius: '4px',
+                        overflow: 'hidden',
+                      }}
+                    >
+                      <div
+                        style={{
+                          width: `${healthPercent}%`,
+                          height: '100%',
+                          backgroundColor: '#22c55e',
+                          transition: 'width 0.2s ease',
+                        }}
+                      />
+                    </div>
+                  </>
+                ) : (
+                  <span style={{ fontSize: '0.7rem', color: '#9ca3af' }}>
+                    {y < 3 ? `A (${x},${y})` : `B (${x},${y - 3})`}
+                  </span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Deterministic Event Stream Inspector */}
+      <div style={{ flex: 1 }}>
+        <h3>Current Event Frame</h3>
+        <pre
+          style={{
+            backgroundColor: '#1f2937',
+            color: '#f9fafb',
+            padding: '1rem',
+            borderRadius: '6px',
+            fontSize: '0.85rem',
+          }}
+        >
+          {JSON.stringify(currentEvent, null, 2)}
+        </pre>
+      </div>
+    </div>
+  );
+};
